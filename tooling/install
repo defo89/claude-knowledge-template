@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Connect this knowledge repo to Claude Code. Safe to re-run; tooling/uninstall undoes it.
+#
+#   CLAUDE_CONFIG_DIR     Claude Code config folder (default: ~/.claude)
+#   KNOWLEDGE_MEMORY_DIR  shared auto-memory folder (default: ~/.claude-memory);
+#                         set it empty to leave Claude Code's auto memory as it is
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+memory=${KNOWLEDGE_MEMORY_DIR-$HOME/.claude-memory}
+tilde() { case $1 in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+repo_ref=$(tilde "$repo")
+memory_ref=""
+[ -z "$memory" ] || memory_ref=$(tilde "$memory")
+begin='<!-- knowledge-repo:begin -->'
+end='<!-- knowledge-repo:end -->'
+
+case $repo in
+  *' '*) echo "The repo path contains a space. Move it (for example to ~/knowledge) and run this again." >&2; exit 1 ;;
+esac
+command -v gitleaks >/dev/null 2>&1 || echo "note: gitleaks not found; commits only get a basic secret check (brew install gitleaks)"
+
+# 1. Git hooks: rebuild INDEX.md, scan for secrets and apply blocked-patterns.txt on every commit.
+git -C "$repo" config core.hooksPath "$repo/tooling/githooks"
+
+# 2. The /remember skill.
+mkdir -p "$config/skills"
+ln -sfn "$repo/tooling/skills/remember" "$config/skills/remember"
+
+# 3. User CLAUDE.md: where the repo is, plus the instructions for every session.
+claude_md="$config/CLAUDE.md"
+touch "$claude_md"
+tmp=$(mktemp)
+awk -v b="$begin" -v e="$end" '
+  $0 == b { skip = 1 }
+  !skip { lines[++n] = $0 }
+  $0 == e { skip = 0 }
+  END { while (n > 0 && lines[n] == "") n--; for (i = 1; i <= n; i++) print lines[i]; if (n > 0) print "" }
+' "$claude_md" > "$tmp"
+printf '%s\nKnowledge repo: `%s`\n@%s/tooling/instructions.md\n%s\n' "$begin" "$repo_ref" "$repo_ref" "$end" >> "$tmp"
+cat "$tmp" > "$claude_md"
+rm -f "$tmp"
+
+# 4. settings.json: let Claude read the repo from any folder, and share one auto memory.
+settings="$config/settings.json"
+if command -v jq >/dev/null 2>&1; then
+  [ -s "$settings" ] || echo '{}' > "$settings"
+  wanted='([.permissions.additionalDirectories[]?] | any(. == $r)) and ($m == "" or .autoMemoryDirectory == $m)'
+  if ! jq -e --arg r "$repo" --arg m "$memory_ref" "$wanted" "$settings" >/dev/null; then
+    tmp=$(mktemp)
+    jq --arg r "$repo" --arg m "$memory_ref" '
+      .permissions.additionalDirectories = (((.permissions.additionalDirectories // []) + [$r]) | unique)
+      | if $m == "" then . else .autoMemoryDirectory = $m end' "$settings" > "$tmp"
+    cat "$tmp" > "$settings"
+    rm -f "$tmp"
+  fi
+else
+  echo "jq not found: in $settings, add \"$repo\" to permissions.additionalDirectories${memory_ref:+ and set \"autoMemoryDirectory\": \"$memory_ref\"}"
+fi
+[ -z "$memory" ] || mkdir -p "$memory"
+
+echo "Installed into $config. Start a new claude session, then try: remember that <something worth keeping>"

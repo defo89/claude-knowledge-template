@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Undo tooling/install. Your notes and the shared auto-memory folder stay as they are.
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+memory=${KNOWLEDGE_MEMORY_DIR-$HOME/.claude-memory}
+tilde() { case $1 in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+memory_ref=""
+[ -z "$memory" ] || memory_ref=$(tilde "$memory")
+begin='<!-- knowledge-repo:begin -->'
+end='<!-- knowledge-repo:end -->'
+
+git -C "$repo" config --unset core.hooksPath 2>/dev/null || true
+
+link="$config/skills/remember"
+if [ -L "$link" ] && [ "$(readlink "$link")" = "$repo/tooling/skills/remember" ]; then
+  rm "$link"
+fi
+
+claude_md="$config/CLAUDE.md"
+if [ -f "$claude_md" ]; then
+  tmp=$(mktemp)
+  awk -v b="$begin" -v e="$end" '
+    $0 == b { skip = 1 }
+    !skip { lines[++n] = $0 }
+    $0 == e { skip = 0 }
+    END { while (n > 0 && lines[n] == "") n--; for (i = 1; i <= n; i++) print lines[i] }
+  ' "$claude_md" > "$tmp"
+  cat "$tmp" > "$claude_md"
+  rm -f "$tmp"
+fi
+
+settings="$config/settings.json"
+if [ -f "$settings" ] && command -v jq >/dev/null 2>&1; then
+  tmp=$(mktemp)
+  jq --arg r "$repo" --arg m "$memory_ref" '
+    if .permissions.additionalDirectories then
+      .permissions.additionalDirectories |= map(select(. != $r))
+      | if .permissions.additionalDirectories == [] then del(.permissions.additionalDirectories) else . end
+      | if .permissions == {} then del(.permissions) else . end
+    else . end
+    | if $m != "" and .autoMemoryDirectory == $m then del(.autoMemoryDirectory) else . end' "$settings" > "$tmp"
+  cat "$tmp" > "$settings"
+  rm -f "$tmp"
+fi
+
+echo "Uninstalled from $config. The notes in $repo and the auto-memory folder were left as they are."

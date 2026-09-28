@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Regenerate INDEX.md from the frontmatter of every note.
+# Usage: reindex [repo-dir]   (default: the current git repo)
+set -euo pipefail
+
+cd "${1:-$(git rev-parse --show-toplevel)}"
+
+entry() {
+  awk -v slug="$(basename "$1" .md)" -v q="'" '
+    function val(s) { sub(/^[a-z_]+:[ \t]*/, "", s); gsub("^[\"" q "]|[\"" q "]$", "", s); return s }
+    NR == 1 && $0 != "---" { exit }
+    NR > 1 && $0 == "---" {
+      meta = type
+      if (as_of != "") meta = meta (meta != "" ? ", " : "") as_of
+      if (status == "superseded") meta = meta ", superseded"
+      printf "- [[%s]] — %s%s\n", slug, (title != "" ? title : slug), (meta != "" ? " (" meta ")" : "")
+      exit
+    }
+    /^title:/  { title = val($0) }
+    /^type:/   { type = val($0) }
+    /^as_of:/  { as_of = val($0) }
+    /^status:/ { status = val($0) }
+  ' "$1"
+}
+
+{
+  printf '# Index\n\nGenerated from note frontmatter by the pre-commit hook. Do not edit by hand.\n'
+  for dir in projects findings; do
+    set -- "$dir"/*.md
+    [ -e "$1" ] || continue
+    case $dir in
+      projects) printf '\n## Projects\n\n' ;;
+      findings) printf '\n## Findings\n\n' ;;
+    esac
+    for note in "$@"; do entry "$note"; done
+  done
+} > INDEX.md

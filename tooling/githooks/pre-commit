@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-commit hook for the knowledge repo (core.hooksPath points here):
+#  1. rebuilds INDEX.md,
+#  2. scans staged changes for secrets (gitleaks; basic patterns if it is missing),
+#  3. rejects added note lines that match tooling/blocked-patterns.txt.
+set -euo pipefail
+
+die() { printf 'pre-commit: %s\n' "$*" >&2; exit 1; }
+tooling=$(cd "$(dirname "$0")/.." && pwd)
+
+"$tooling/reindex" .
+git add INDEX.md
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --pre-commit --staged --redact --no-banner --log-level warn -v . \
+    || die "gitleaks flagged a possible secret (see above)"
+else
+  echo "pre-commit: gitleaks not installed, checking basic secret patterns only" >&2
+  if git diff --cached -U0 | grep '^+' | grep -Eq \
+    '(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[abprs]-[A-Za-z0-9-]{10,}|sk-ant-[A-Za-z0-9_-]{20,}'; then
+    die "possible secret in staged changes"
+  fi
+fi
+
+patterns="$tooling/blocked-patterns.txt"
+if [ -f "$patterns" ] && grep -Evq '^[[:space:]]*(#|$)' "$patterns"; then
+  hits=$(git diff --cached -U0 -- findings projects | grep '^+' | grep -v '^+++' \
+    | grep -Ei -f <(grep -Ev '^[[:space:]]*(#|$)' "$patterns") || true)
+  [ -z "$hits" ] || die "staged notes match tooling/blocked-patterns.txt:
+$hits"
+fi

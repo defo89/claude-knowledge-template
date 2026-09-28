@@ -1,0 +1,5 @@
+# One extended regular expression per line, matched case-insensitively.
+# The pre-commit hook rejects staged note lines that match any of them.
+# Empty by default. Examples, for a repo hosted outside your company:
+#   \.corp\.example\.com
+#   @example\.com
