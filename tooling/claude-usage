@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+# Token usage of every Claude Code session on one day, from the local transcripts of all profiles
+# (~/.claude*/projects, subagents included). Each API call counts once.
+# Usage: claude-usage [YYYY-MM-DD]   (default: today, local time)
+#
+# ctx: tokens a call sent (input + cache write + cache read). Every call re-sends the whole conversation.
+# re-cache: a call that wrote more than 200k tokens to the prompt cache, i.e. the whole context going
+#   back in, normally the first call after the cache expired.
+# Weighted shares use Anthropic API price ratios (cache read 0.1, 5-minute cache write 1.25, 1-hour
+# cache write 2, output 5 times an input token). How a claude.ai plan weighs token types is not published.
+import datetime as dt
+import glob
+import json
+import os
+import statistics
+import sys
+
+RECACHE = 200_000
+BASELINE_DAYS = 21
+
+
+def ctx(call):
+    return call["input"] + call["write"] + call["read"]
+
+
+def kilo(n):
+    return f"{n / 1000:.0f}k"
+
+
+def mega(n):
+    return f"{n / 1e6:.1f}M"
+
+
+def idle(delta):
+    hours = delta.total_seconds() / 3600
+    if hours >= 48:
+        return f"{hours / 24:.0f}d"
+    return f"{hours:.0f}h" if hours >= 1 else f"{hours * 60:.0f}m"
+
+
+def median(values):
+    return f"{kilo(statistics.median(values))} (n={len(values)})" if values else "n/a"
+
+
+def read_transcript(path):
+    """Title, API calls (one per message id, last record wins) and tool-result sizes of one transcript."""
+    title, calls, tools, compacted = None, {}, [], False
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            kind, msg = r.get("type"), r.get("message")
+            if kind == "custom-title":
+                title = r.get("customTitle") or title
+            elif kind == "summary":
+                title = title or r.get("summary")
+            if r.get("isCompactSummary"):
+                compacted = True
+                continue
+            if not isinstance(msg, dict) or not r.get("timestamp"):
+                continue
+            t = dt.datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).astimezone()
+            if kind == "user" and isinstance(msg.get("content"), list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        body = block.get("content")
+                        tools.append((t, len(body if isinstance(body, str) else json.dumps(body)) // 4))
+            usage = msg.get("usage")
+            if kind != "assistant" or not usage or msg.get("model") == "<synthetic>":
+                continue
+            mid = msg.get("id") or r.get("requestId") or r.get("uuid")
+            first = calls.get(mid)
+            calls[mid] = {
+                "id": mid,
+                "t": first["t"] if first else t,
+                "compacted": first["compacted"] if first else compacted,
+                "model": msg.get("model"),
+                "input": usage.get("input_tokens") or 0,
+                "read": usage.get("cache_read_input_tokens") or 0,
+                "write": usage.get("cache_creation_input_tokens") or 0,
+                "write_5m": (usage.get("cache_creation") or {}).get("ephemeral_5m_input_tokens") or 0,
+                "output": usage.get("output_tokens") or 0,
+            }
+            compacted = False
+    return title, list(calls.values()), tools
+
+
+def main():
+    try:
+        day = dt.date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else dt.date.today()
+    except ValueError:
+        sys.exit("usage: claude-usage [YYYY-MM-DD]")
+    start = dt.datetime.combine(day, dt.time()).timestamp()
+    home = os.path.expanduser("~")
+    paths = sorted(glob.glob(f"{home}/.claude*/projects/*/*.jsonl"))
+    paths += sorted(glob.glob(f"{home}/.claude*/projects/*/*/subagents/*.jsonl"))
+
+    sessions, fresh, after_compact, seen = {}, [], [], set()
+    for path in paths:
+        mtime = os.path.getmtime(path)
+        if mtime < start - BASELINE_DAYS * 86400:
+            continue
+        title, calls, tools = read_transcript(path)
+        # A session copied to another profile carries its history along: count each API call once.
+        new = [c for c in calls if c["id"] not in seen]
+        seen.update(c["id"] for c in calls)
+        if not new:
+            continue
+        profile, _, _, sid, *sub = os.path.relpath(path, home).split(os.sep)
+        if not sub and new[0] is calls[0] and not calls[0]["compacted"]:
+            fresh.append(ctx(calls[0]))
+        after_compact += [ctx(c) for c in new if c["compacted"]]
+        calls = new
+        if mtime < start:
+            continue
+        s = sessions.setdefault((profile, sid.removesuffix(".jsonl")),
+                                {"title": None, "since": calls[0]["t"], "calls": [], "sub": 0, "recaches": [], "tool": 0})
+        s["title"] = s["title"] or (None if sub else title)
+        s["since"] = min(s["since"], calls[0]["t"])
+        for prev, c in zip([None] + calls, calls):
+            if c["t"].date() == day:
+                s["calls"].append(c)
+                s["sub"] += bool(sub)
+                if c["write"] > RECACHE:
+                    s["recaches"].append((c["write"], c["t"] - prev["t"] if prev else None))
+        s["tool"] = max([s["tool"]] + [size for t, size in tools if t.date() == day])
+
+    rows = sorted((kv for kv in sessions.items() if kv[1]["calls"]), key=lambda kv: kv[1]["calls"][0]["t"])
+    if not rows:
+        print(f"No Claude Code API calls on {day}.")
+        return
+    print(f"Claude Code usage on {day} (local time)\n")
+    print(f"{'session':<36} {'since':<10} {'calls':>11} {'avg ctx':>7} {'max ctx':>7} {'read':>6} {'write':>6} "
+          f"{'output':>6} {'tool max':>8}  re-caches (idle before)")
+    for (profile, sid), s in rows:
+        calls = s["calls"]
+        name = f"{profile.removeprefix('.claude').lstrip('-') or 'default'}/{sid[:8]} {s['title'] or ''}"
+        count = f"{len(calls)}" + (f" ({s['sub']} sub)" if s["sub"] else "")
+        recaches = f"{len(s['recaches'])}"
+        if s["recaches"]:
+            recaches += (f" = {mega(sum(w for w, _ in s['recaches']))} ("
+                         + ", ".join(idle(gap) if gap else "start" for _, gap in s["recaches"]) + ")")
+        print(f"{name[:36]:<36} {s['since']:%Y-%m-%d} {count:>11} {kilo(sum(map(ctx, calls)) / len(calls)):>7} "
+              f"{kilo(max(map(ctx, calls))):>7} {mega(sum(c['read'] for c in calls)):>6} "
+              f"{mega(sum(c['write'] for c in calls)):>6} {kilo(sum(c['output'] for c in calls)):>6} "
+              f"{kilo(s['tool']):>8}  {recaches}")
+
+    every = [c for _, s in rows for c in s["calls"]]
+    total = {key: sum(c[key] for c in every) for key in ("input", "read", "write", "write_5m", "output")}
+    recached = sum(w for _, s in rows for w, _ in s["recaches"])
+    print(f"\ntotal: {len(every)} calls, cache read {mega(total['read'])}, cache write {mega(total['write'])} "
+          f"(re-caches {mega(recached)}), uncached input {kilo(total['input'])}, output {kilo(total['output'])}")
+    writes = 1.25 * total["write_5m"] + 2 * (total["write"] - total["write_5m"])
+    weighted = {"cache reads": 0.1 * total["read"], "cache writes": writes,
+                "output": 5 * total["output"], "uncached input": total["input"]}
+    whole = sum(weighted.values()) or 1
+    print("API-price-weighted share: " + ", ".join(f"{name} {value / whole:.0%}" for name, value in weighted.items())
+          + f" (re-caches {writes * recached / (total['write'] or 1) / whole:.0%})")
+    models = {}
+    for c in every:
+        models[c["model"]] = models.get(c["model"], 0) + 1
+    print("calls per model: " + ", ".join(f"{name} {n}" for name, n in sorted(models.items(), key=lambda kv: -kv[1])))
+    print(f"context sent, last {BASELINE_DAYS} days: first call of a fresh session median {median(fresh)}, "
+          f"first call after a compaction median {median(after_compact)}")
+
+
+if __name__ == "__main__":
+    main()

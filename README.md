@@ -5,7 +5,7 @@ Long-term memory for Claude Code: one private git repo of Markdown notes that ev
 ## How it works
 
 ```text
-every session ── loads ──▶ tooling/instructions.md + your MEMORY.md index   (≈0.5–1k tokens, always)
+every session ── loads ──▶ tooling/instructions.md + your MEMORY.md index   (≈0.6–1k tokens, always)
      │
      ├─ recall ─────▶ grep findings/ and projects/, read the 1–2 notes that match   (≈1k tokens, on demand)
      └─ /remember ──▶ write or update one note ─▶ pre-commit hook ─▶ commit ─▶ push
@@ -14,7 +14,7 @@ every session ── loads ──▶ tooling/instructions.md + your MEMORY.md in
 - `findings/`: one durable fact per note (a finding, decision, how-to or reference).
 - `projects/`: the state of ongoing efforts, rewritten as things change.
 - `INDEX.md`: one line per note, rebuilt on every commit.
-- `tooling/`: the instructions Claude gets, the `/remember` skill, the git hook and the installer.
+- `tooling/`: the instructions Claude gets, the `/remember` skill, the git hook, the installer and `claude-usage`, which shows what each session costs in tokens.
 
 The notes are plain Markdown in git, so every change can be reviewed with `git log -p`, nothing is locked into a tool, and the folder opens as an Obsidian vault. There is no database, embedding model or MCP server: Claude uses the search and read tools it already has.
 
@@ -51,7 +51,8 @@ In the repo it sets `core.hooksPath` to `tooling/githooks`. Running it again is 
 | Keep what a session found | "remember this", or `/remember` (without an argument it suggests up to five candidates) |
 | Keep something specific | `/remember <what>`, ideally with the reason: "remember that X, because Y" |
 | Use what is already known | Just work: Claude checks the repo first and says which notes it used. Or ask "what do we know about X?" |
-| Track a multi-session effort | "Start a project note for X", and at the end of a session "update the X project note" |
+| Track a multi-session effort | "Start a project note for X" |
+| Stop: a chunk of work is done, or a break of more than an hour is coming | "Update the X project note", then `/clear`. The next session starts from the note instead of re-reading a long conversation ([Cost in tokens](#cost-in-tokens)) |
 | Change how Claude works everywhere | "From now on …" (this goes into the shared auto memory, not the repo) |
 | See what was saved | `git -C ~/knowledge log -p` |
 | Browse | `INDEX.md`, or open the folder in Obsidian |
@@ -78,23 +79,25 @@ The fact in one to three sentences.
 Related: [[other-slug]]
 ```
 
-The file name is the slug (`findings/<slug>.md`), so `[[slug]]` links resolve in Obsidian. `projects/example-project.md` shows a project note; delete it once you have your own. The two notes in `findings/` are real Claude Code findings and worth keeping.
+The file name is the slug (`findings/<slug>.md`), so `[[slug]]` links resolve in Obsidian. `projects/example-project.md` shows a project note; delete it once you have your own. The three notes in `findings/` are real Claude Code findings and worth keeping.
 
 ## Cost in tokens
 
 Measured on a working setup, estimating tokens as bytes ÷ 4:
 
-- **Every session:** the instructions (≈340 tokens), the skill description (≈100) and your auto-memory index: about 0.5k to start and around 1k once the index has grown. It is the same text every turn, which suits prompt caching.
+- **Every session:** the instructions (≈460 tokens), the skill description (≈100) and your auto-memory index: about 0.6k to start and around 1k once the index has grown. It is the same text every turn, which suits prompt caching.
 - **A recall:** a grep plus one median note, about 1k tokens, and only when a topic comes up.
 - **A save:** the `/remember` instructions, about 0.9k tokens, and only when you save.
 
 For comparison, loading all 60 notes of that setup into every session would cost about 76k tokens, and the notes were about 220× smaller than the raw session transcripts they came from. Claude Code deletes transcripts after 30 days by default; the notes stay.
 
+The bigger cost is the session itself, and the repo is what lets you keep sessions short. Every call re-sends the whole conversation as a cheaper cache read, and the cache lasts an hour: the first call after a longer break writes all of it to the cache again. A fresh session starts at about 37k tokens (system prompt, tools, CLAUDE.md, auto memory); one left open for days re-sends up to 0.9M on every call. On one measured day of three long-lived sessions, at API price ratios, cache reads were about half of the cost, cache writes over a third (almost all full re-caches after hours idle) and output under a tenth. Updating a project note and running `/clear` starts the next session at about 40k instead of resuming at 900k. Details in `findings/claude-code-token-usage.md`; measure your own day with `tooling/claude-usage [YYYY-MM-DD]`.
+
 ## Limits, and how to keep it cheap
 
 | Watch out for | Keep it healthy |
 |---|---|
-| Very long sessions: every note read stays in context until compaction | Save at milestones, not once at the end of a long day |
+| Long sessions: every call re-sends the whole conversation, and after an hour idle all of it is written to the cache again | One session per chunk of work: update the project note, then `/clear`. `/remember` alone saves nothing; the `/clear` after it does. If a session must go on, `/compact` early (~150–200k) |
 | Very long notes: costly to read and harder to search | One fact per note, 3 KB or less; project notes hold state, not a diary |
 | Word-based search: synonyms can slip through as notes pile up | Claude tries synonyms; add a semantic index only when lookups miss, built from the Markdown and never a second copy |
 | Stale notes | Check `as_of`, verify, and mark old notes `status: superseded` |

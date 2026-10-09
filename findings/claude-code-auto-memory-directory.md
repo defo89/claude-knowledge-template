@@ -17,4 +17,4 @@ The `autoMemoryDirectory` setting (supports `~/`) points every session at one fo
 
 **How to apply:** keep that shared index short, preferences and one-line pointers only, because it loads into every session.
 
-Related: [[claude-code-skills-folder-needs-restart]]
+Related: [[claude-code-skills-folder-needs-restart]], [[claude-code-token-usage]]
