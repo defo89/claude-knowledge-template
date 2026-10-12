@@ -6,8 +6,9 @@
 # ctx: tokens a call sent (input + cache write + cache read). Every call re-sends the whole conversation.
 # re-cache: a call that wrote more than 200k tokens to the prompt cache, i.e. the whole context going
 #   back in, normally the first call after the cache expired.
-# Weighted shares use Anthropic API price ratios (cache read 0.1, 5-minute cache write 1.25, 1-hour
-# cache write 2, output 5 times an input token). How a claude.ai plan weighs token types is not published.
+# Weighted shares use Anthropic API price ratios (cache read 0.1, or 0.05 on Claude Opus 5.5 and 0.025 on
+# Claude Fable 5.1 and Mythos 5.1; 5-minute cache write 1.25, 1-hour cache write 2, output 5 times an input
+# token). How a claude.ai plan weighs token types is not published.
 import datetime as dt
 import glob
 import json
@@ -16,6 +17,7 @@ import statistics
 import sys
 
 RECACHE = 200_000
+READ_RATIO = {"claude-opus-5-5": 0.05, "claude-fable-5-1": 0.025, "claude-mythos-5-1": 0.025}  # else 0.1
 BASELINE_DAYS = 21
 
 
@@ -153,7 +155,8 @@ def main():
     print(f"\ntotal: {len(every)} calls, cache read {mega(total['read'])}, cache write {mega(total['write'])} "
           f"(re-caches {mega(recached)}), uncached input {kilo(total['input'])}, output {kilo(total['output'])}")
     writes = 1.25 * total["write_5m"] + 2 * (total["write"] - total["write_5m"])
-    weighted = {"cache reads": 0.1 * total["read"], "cache writes": writes,
+    reads = sum(next((r for m, r in READ_RATIO.items() if (c["model"] or "").startswith(m)), 0.1) * c["read"] for c in every)
+    weighted = {"cache reads": reads, "cache writes": writes,
                 "output": 5 * total["output"], "uncached input": total["input"]}
     whole = sum(weighted.values()) or 1
     print("API-price-weighted share: " + ", ".join(f"{name} {value / whole:.0%}" for name, value in weighted.items())
