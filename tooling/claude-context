@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+# How full the context of a Claude Code session is: the tokens its latest API call sent (input + cache write +
+# cache read, the count behind Claude Code's own context percentage) and their share of the context window.
+# Usage: claude-context [SESSION_ID | TRANSCRIPT.jsonl]   (default: $CLAUDE_CODE_SESSION_ID, the session running it)
+#
+# Window as Claude Code sizes it (docs, 2026-10): 1M for Fable, Opus 4.7 and later, Sonnet 5 and later and Haiku 5.5,
+# or with a [1m] model setting; 200k for other models, or for all with CLAUDE_CODE_DISABLE_1M_CONTEXT=1. A session
+# that already went past 200k counts as 1M.
+import glob
+import json
+import os
+import re
+import sys
+
+NATIVE_1M = {"fable": (), "opus": (4, 7), "sonnet": (5,), "haiku": (5, 5)}  # first version with the 1M default
+CONFIG = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def transcript(arg):
+    if arg and arg.endswith(".jsonl"):
+        return arg
+    sid = arg or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid:
+        sys.exit("usage: claude-context [SESSION_ID | TRANSCRIPT.jsonl]  (no CLAUDE_CODE_SESSION_ID: not run by Claude Code)")
+    paths = glob.glob(f"{CONFIG}/projects/*/{sid}.jsonl") + glob.glob(os.path.expanduser(f"~/.claude*/projects/*/{sid}.jsonl"))
+    if not paths:
+        sys.exit(f"claude-context: no transcript for session {sid}")
+    return max(paths, key=os.path.getmtime)
+
+
+def last_call(path):
+    """Model and context size of the latest API call of the main conversation, and the largest context so far."""
+    model, size, peak = None, 0, 0
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            msg = r.get("message")
+            if r.get("type") != "assistant" or r.get("isSidechain") or not isinstance(msg, dict):
+                continue
+            usage = msg.get("usage")
+            if not usage or msg.get("model") == "<synthetic>":
+                continue
+            model = msg.get("model") or ""
+            size = sum(usage.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+            peak = max(peak, size)
+    return model, size, peak
+
+
+def model_setting():
+    if os.environ.get("ANTHROPIC_MODEL"):
+        return os.environ["ANTHROPIC_MODEL"]
+    try:
+        with open(f"{CONFIG}/settings.json", encoding="utf-8") as fh:
+            return json.load(fh).get("model") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+def window(model, peak):
+    if os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT", "").lower() in ("1", "true"):
+        return 200_000
+    m = re.search(r"claude-([a-z]+)-(\d+)(?:-(\d{1,2})(?!\d))?", model)
+    native = bool(m) and m.group(1) in NATIVE_1M and tuple(int(v) for v in m.group(2, 3) if v) >= NATIVE_1M[m.group(1)]
+    return 1_000_000 if native or "[1m]" in model_setting().lower() or peak > 200_000 else 200_000
+
+
+def main():
+    if len(sys.argv) > 2 or sys.argv[1:] in (["-h"], ["--help"]):
+        sys.exit("usage: claude-context [SESSION_ID | TRANSCRIPT.jsonl]")
+    path = transcript(sys.argv[1] if len(sys.argv) > 1 else None)
+    model, size, peak = last_call(path)
+    if model is None:
+        sys.exit(f"claude-context: no API call in {path} yet")
+    limit = window(model, peak)
+    name = "1M" if limit == 1_000_000 else f"{limit // 1000}k"
+    print(f"{size / 1000:.0f}k tokens, {size / limit:.0%} of the {name} context window ({model})")
+
+
+if __name__ == "__main__":
+    main()
