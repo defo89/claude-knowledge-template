@@ -63,7 +63,7 @@ Related: [[<slug>]]
 
 Keep `title` in double quotes, with no double quotes inside it.
 
-A `project` note names the effort in `title`, then gives the goal, links (issues, PRs), current state and open items, each with dates. Rewrite the state and open items as they change instead of appending a diary. Move finished detail into dated history bullets, and pull reusable lessons out into findings.
+A `project` note names the effort in `title`, then gives the goal, links (issues, PRs), current state and open items, each with dates. Open items include the next step, with the commands or links to check it, so a fresh session can continue from the note alone. Rewrite the state and open items as they change instead of appending a diary. Move finished detail into dated history bullets, and pull reusable lessons out into findings.
 
 ## 5. Commit and push
 
@@ -75,4 +75,4 @@ git -C <repo> push
 
 The pre-commit hook regenerates `INDEX.md`, scans for secrets and rejects anything in `tooling/blocked-patterns.txt`. If it blocks the commit, fix the note. Never bypass it with `--no-verify` unless the user says so. If the push fails (offline, VPN, credentials), say so and keep the local commit.
 
-Finish with one line per note: path, title, and whether it was pushed.
+Finish with one line per note: path, title, and whether it was pushed. If the save is part of a hand-off, then ask the user to run `/clear` and end with a continuation prompt in a code block: the note to read, and the next step.

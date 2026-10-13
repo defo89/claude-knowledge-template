@@ -19,6 +19,7 @@ Delete this file once you have a real project note. It shows the shape Claude ke
 ## Open
 
 - Each open item, with a date or an owner.
+- Next: the step a fresh session starts with, and the command or link that checks it.
 
 ## History
 
