@@ -52,7 +52,7 @@ In the repo it sets `core.hooksPath` to `tooling/githooks`. Running it again is 
 | Keep something specific | `/remember <what>`, ideally with the reason: "remember that X, because Y" |
 | Use what is already known | Just work: Claude checks the repo first and says which notes it used. Or ask "what do we know about X?" |
 | Track a multi-session effort | "Start a project note for X" |
-| Stop: a chunk of work is done, or a break of more than an hour is coming | Claude hands off on its own: it updates the project note, asks you to `/clear` and gives you a prompt to paste into the fresh session, which starts from the note instead of re-reading a long conversation ([Cost in tokens](#cost-in-tokens)). Say "hand off" to trigger it yourself |
+| Stop: a chunk of work is done, or a break of more than an hour is coming | Claude hands off on its own: it updates the project note, asks you to `/clear` and puts a prompt for the fresh session on your clipboard; the fresh session starts from the note instead of re-reading a long conversation ([Cost in tokens](#cost-in-tokens)). Say "hand off" to trigger it yourself |
 | Change how Claude works everywhere | "From now on …" (this goes into the shared auto memory, not the repo) |
 | See what was saved | `git -C ~/knowledge log -p` |
 | Browse | `INDEX.md`, or open the folder in Obsidian |
@@ -85,7 +85,7 @@ The file name is the slug (`findings/<slug>.md`), so `[[slug]]` links resolve in
 
 Measured on a working setup, estimating tokens as bytes ÷ 4:
 
-- **Every session:** the instructions (≈570 tokens), the skill description (≈100) and your auto-memory index: about 0.7k to start and around 1k once the index has grown. It is the same text every turn, which suits prompt caching.
+- **Every session:** the instructions (≈620 tokens), the skill description (≈100) and your auto-memory index: about 0.7k to start and around 1k once the index has grown. It is the same text every turn, which suits prompt caching.
 - **A recall:** a grep plus one median note, about 1k tokens, and only when a topic comes up.
 - **A save:** the `/remember` instructions, about 1k tokens, and only when you save.
 
@@ -97,7 +97,7 @@ The bigger cost is the session itself, and the repo is what lets you keep sessio
 
 | Watch out for | Keep it healthy |
 |---|---|
-| Long sessions: every call re-sends the whole conversation, and after an hour idle all of it is written to the cache again | One session per chunk of work: at a hand-off Claude updates the project note and gives you a prompt for the fresh session; run `/clear` and paste it. `/remember` alone saves nothing; the `/clear` after it does. If a session must go on, `/compact` early (~150–200k) |
+| Long sessions: every call re-sends the whole conversation, and after an hour idle all of it is written to the cache again | One session per chunk of work: at a hand-off Claude updates the project note and copies a prompt for the fresh session to the clipboard; run `/clear` and paste it. `/remember` alone saves nothing; the `/clear` after it does. If a session must go on, `/compact` early (~150–200k) |
 | Very long notes: costly to read and harder to search | One fact per note, 3 KB or less; project notes hold state, not a diary |
 | Word-based search: synonyms can slip through as notes pile up | Claude tries synonyms; add a semantic index only when lookups miss, built from the Markdown and never a second copy |
 | Stale notes | Check `as_of`, verify, and mark old notes `status: superseded` |

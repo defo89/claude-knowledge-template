@@ -75,4 +75,4 @@ git -C <repo> push
 
 The pre-commit hook regenerates `INDEX.md`, scans for secrets and rejects anything in `tooling/blocked-patterns.txt`. If it blocks the commit, fix the note. Never bypass it with `--no-verify` unless the user says so. If the push fails (offline, VPN, credentials), say so and keep the local commit.
 
-Finish with one line per note: path, title, and whether it was pushed. If the save is part of a hand-off, then ask the user to run `/clear` and end with a continuation prompt in a code block: the note to read, and the next step.
+Finish with one line per note: path, title, and whether it was pushed. If the save is part of a hand-off, then ask the user to run `/clear` and end with a continuation prompt in a code block: the note to read, and the next step. Copy the prompt to the clipboard as well (pipe it without a trailing newline to `pbcopy` on macOS, `wl-copy` or `xclip -selection clipboard` on Linux, or `clip.exe` on Windows).
