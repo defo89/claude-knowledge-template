@@ -13,7 +13,7 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-base_file="$repo/tooling/.upstream-base"
+base_state_file="$repo/tooling/.upstream-base"
 upstream_repo="videlov/claude-knowledge-template"
 upstream_url="https://github.com/$upstream_repo"
 
@@ -26,6 +26,8 @@ TRACKABLE_PREFIXES=(
   "findings/claude-code-token-usage.md"
 )
 # Always skip these even if they match a prefix (generated or user-filled).
+# check-upstream skips itself to avoid self-modification during sync;
+# update it manually or via a separate PR when the upstream skill changes.
 SKIP_PATHS=(
   "INDEX.md"
   "tooling/.upstream-base"
@@ -47,16 +49,19 @@ if [ ! -d "$upstream_dir" ]; then
   exit 1
 fi
 
-# Get the upstream HEAD commit SHA via the GitHub API (unauthenticated, public repo).
-upstream_sha=$(curl -fsSL "https://api.github.com/repos/$upstream_repo/commits/main" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])' 2>/dev/null || echo "unknown")
+# Get the upstream HEAD commit SHA (no auth needed, no rate limit, no python3).
+upstream_sha=$(git ls-remote "https://github.com/$upstream_repo.git" refs/heads/main | cut -f1)
+if [ -z "$upstream_sha" ]; then upstream_sha="unknown"; fi
 
 # --- Determine the base version ---
 # If we have a stored base, fetch that tarball too for three-way merge.
-# Otherwise, treat the current local files as the base (first run: no merge, just diff).
+# Otherwise, bootstrap by finding the newest upstream commit older than the
+# repo's first commit (for "Use this template" copies), then fall back to
+# treating current upstream as the base.
 base_dir=""
 base_sha=""
-if [ -f "$base_file" ]; then
-  base_sha=$(cat "$base_file" | tr -d '[:space:]')
+if [ -f "$base_state_file" ]; then
+  base_sha=$(cat "$base_state_file" | tr -d '[:space:]')
   echo "Stored base: ${base_sha:0:12}"
   if curl -fsSL "$upstream_url/archive/$base_sha.tar.gz" | tar -xz -C "$tmp" 2>/dev/null; then
     # The extracted directory name uses the full SHA
@@ -66,6 +71,26 @@ if [ -f "$base_file" ]; then
     echo "warning: could not fetch base commit $base_sha; falling back to local-as-base" >&2
     base_dir=""
     base_sha=""
+  fi
+else
+  # First run: bootstrap the base.
+  # For a "Use this template" copy, find the newest upstream commit before the repo's first commit.
+  first_commit_date=$(git -C "$repo" log --reverse --format='%aI' | head -1)
+  if [ -n "$first_commit_date" ]; then
+    bootstrap_sha=$(curl -fsSL "https://api.github.com/repos/$upstream_repo/commits?until=$first_commit_date&per_page=1" \
+      | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c[0]["sha"] if c else "")' 2>/dev/null || true)
+    if [ -n "$bootstrap_sha" ]; then
+      echo "Bootstrapping base from upstream commit ${bootstrap_sha:0:12} (before repo creation)"
+      if curl -fsSL "$upstream_url/archive/$bootstrap_sha.tar.gz" | tar -xz -C "$tmp" 2>/dev/null; then
+        base_dir=$(find "$tmp" -maxdepth 1 -type d -name "claude-knowledge-template-*" ! -name "claude-knowledge-template-main" | head -1)
+        if [ -n "$base_dir" ] && [ -d "$base_dir" ]; then
+          base_sha="$bootstrap_sha"
+        fi
+      fi
+    fi
+  fi
+  if [ -z "$base_sha" ]; then
+    echo "note: could not bootstrap base; files will be reported as 'changed (no base)'"
   fi
 fi
 
@@ -238,7 +263,7 @@ for rel in $(printf '%s\n' "${!status[@]}" | sort); do
 done
 
 # Update the base commit
-echo "$upstream_sha" > "$base_file"
+echo "$upstream_sha" > "$base_state_file"
 echo ""
 echo "Applied $applied file(s), $conflicted conflict(s)."
 echo "Base updated to ${upstream_sha:0:12}."
