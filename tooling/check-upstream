@@ -1,272 +1,388 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # Compare this knowledge repo's tooling against the upstream template and prepare updates.
-# Uses three-way merge to preserve local adaptations while pulling in upstream changes.
+# A copy made with "Use this template" shares no history with the template, so it never
+# gets tooling fixes through git. This pulls them in with a three-way merge that keeps
+# local adaptations.
 #
-# Usage: check-upstream [--apply]
-#   Without --apply: prints a summary table of what changed.
-#   With --apply: performs three-way merges, writes results to the repo,
-#                 and updates the base commit for next time.
+# Usage: check-upstream [--apply [PATH ...]] [--diff PATH]
+#   (no args)        print a summary of what changed, per file, with a clean/conflict preview
+#   --apply          merge and write every file that is safe or needs review
+#   --apply PATH ... merge and write only the named files
+#   --diff PATH      print the three-way merge result for one file and exit
 #
-# State: tooling/.upstream-base records the upstream commit SHA the local copy was synced to.
-# On first run (no base file), it uses the initial commit of the local repo to find the
-# closest upstream commit, or treats the current upstream as the base.
-set -euo pipefail
+# State: tooling/.upstream-base records the upstream commit the local copy was synced to.
+# The merge needs a base. On the first run there is none, so the base is worked out once:
+# for a "Use this template" copy, the newest upstream commit older than the copy's first
+# commit; for a cloned copy, the newest upstream commit in the copy's own history. If no
+# base can be found, files that differ are reported but never written.
+import gzip
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
-base_state_file="$repo/tooling/.upstream-base"
-upstream_repo="videlov/claude-knowledge-template"
-upstream_url="https://github.com/$upstream_repo"
+UPSTREAM_REPO = "videlov/claude-knowledge-template"
+UPSTREAM_URL = f"https://github.com/{UPSTREAM_REPO}"
 
-# Trackable paths: template scaffolding that should receive upstream updates.
-# User data (findings/, projects/) is excluded except for template-shipped findings.
-TRACKABLE_PREFIXES=(
-  "tooling/"
-  "README.md"
-  ".gitignore"
-  "findings/claude-code-token-usage.md"
-)
-# Always skip these even if they match a prefix (generated or user-filled).
-# check-upstream skips itself to avoid self-modification during sync;
-# update it manually or via a separate PR when the upstream skill changes.
-SKIP_PATHS=(
-  "INDEX.md"
-  "tooling/.upstream-base"
-  "tooling/skills/check-upstream/"
-)
+# Template scaffolding that should receive upstream updates. User data (findings/, projects/)
+# is excluded, except for findings the template ships and the instructions and README cite.
+TRACKABLE_PREFIXES = ("tooling/", "README.md", ".gitignore", "findings/claude-code-token-usage.md")
+# Skipped even if a prefix matches: generated (INDEX.md), state (.upstream-base), and the skill
+# directory, whose SKILL.md travels with this script and is updated together, not merged in.
+SKIP_PATHS = ("INDEX.md", "tooling/.upstream-base", "tooling/skills/check-upstream/")
 
-apply=false
-if [ "${1:-}" = "--apply" ]; then apply=true; fi
+REPO = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+BASE_STATE_FILE = os.path.join(REPO, "tooling", ".upstream-base")
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
 
-# --- Download upstream tarball (no auth needed, public repo) ---
-echo "Fetching upstream from $upstream_url ..."
-curl -fsSL "$upstream_url/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp"
-upstream_dir="$tmp/claude-knowledge-template-main"
-if [ ! -d "$upstream_dir" ]; then
-  echo "error: failed to download upstream tarball" >&2
-  exit 1
-fi
+def die(msg):
+    sys.exit(f"check-upstream: {msg}")
 
-# Get the upstream HEAD commit SHA (no auth needed, no rate limit, no python3).
-upstream_sha=$(git ls-remote "https://github.com/$upstream_repo.git" refs/heads/main | cut -f1)
-if [ -z "$upstream_sha" ]; then upstream_sha="unknown"; fi
 
-# --- Determine the base version ---
-# If we have a stored base, fetch that tarball too for three-way merge.
-# Otherwise, bootstrap by finding the newest upstream commit older than the
-# repo's first commit (for "Use this template" copies), then fall back to
-# treating current upstream as the base.
-base_dir=""
-base_sha=""
-if [ -f "$base_state_file" ]; then
-  base_sha=$(cat "$base_state_file" | tr -d '[:space:]')
-  echo "Stored base: ${base_sha:0:12}"
-  if curl -fsSL "$upstream_url/archive/$base_sha.tar.gz" | tar -xz -C "$tmp" 2>/dev/null; then
-    # The extracted directory name uses the full SHA
-    base_dir=$(find "$tmp" -maxdepth 1 -type d -name "claude-knowledge-template-*" ! -name "claude-knowledge-template-main" | head -1)
-  fi
-  if [ -z "$base_dir" ] || [ ! -d "$base_dir" ]; then
-    echo "warning: could not fetch base commit $base_sha; falling back to local-as-base" >&2
-    base_dir=""
-    base_sha=""
-  fi
-else
-  # First run: bootstrap the base.
-  # For a "Use this template" copy, find the newest upstream commit before the repo's first commit.
-  first_commit_date=$(git -C "$repo" log --reverse --format='%aI' | head -1)
-  if [ -n "$first_commit_date" ]; then
-    bootstrap_sha=$(curl -fsSL "https://api.github.com/repos/$upstream_repo/commits?until=$first_commit_date&per_page=1" \
-      | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c[0]["sha"] if c else "")' 2>/dev/null || true)
-    if [ -n "$bootstrap_sha" ]; then
-      echo "Bootstrapping base from upstream commit ${bootstrap_sha:0:12} (before repo creation)"
-      if curl -fsSL "$upstream_url/archive/$bootstrap_sha.tar.gz" | tar -xz -C "$tmp" 2>/dev/null; then
-        base_dir=$(find "$tmp" -maxdepth 1 -type d -name "claude-knowledge-template-*" ! -name "claude-knowledge-template-main" | head -1)
-        if [ -n "$base_dir" ] && [ -d "$base_dir" ]; then
-          base_sha="$bootstrap_sha"
-        fi
-      fi
-    fi
-  fi
-  if [ -z "$base_sha" ]; then
-    echo "note: could not bootstrap base; files will be reported as 'changed (no base)'"
-  fi
-fi
+def trackable(rel):
+    if any(rel == p or rel.startswith(p) for p in SKIP_PATHS):
+        return False
+    return any(rel == p or rel.startswith(p) for p in TRACKABLE_PREFIXES)
 
-is_trackable() {
-  local path="$1"
-  for skip in "${SKIP_PATHS[@]}"; do
-    case "$path" in "$skip"*) return 1 ;; esac
-  done
-  for prefix in "${TRACKABLE_PREFIXES[@]}"; do
-    case "$path" in "$prefix"*) return 0 ;; esac
-  done
-  return 1
-}
 
-# --- Collect all trackable paths from upstream, local, and base ---
-declare -A all_paths
-while IFS= read -r -d '' f; do
-  rel="${f#"$upstream_dir"/}"
-  if is_trackable "$rel"; then all_paths["$rel"]=1; fi
-done < <(find "$upstream_dir" -type f -print0)
+def git(*args, cwd=REPO):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
 
-while IFS= read -r -d '' f; do
-  rel="${f#"$repo"/}"
-  if is_trackable "$rel"; then all_paths["$rel"]=1; fi
-done < <(find "$repo" -type f -not -path "$repo/.git/*" -print0)
 
-# --- Classify each path ---
-declare -A status  # up-to-date, upstream-only, local-only, changed-upstream, changed-local, changed-both, deleted-upstream
-declare -A merge_result  # path -> file with merge result (for --apply)
-declare -A has_conflicts  # path -> 1 if merge had conflicts
+def download_tarball(ref, dest):
+    """Extract the upstream tarball for a ref (branch or SHA) into a fresh subdir of dest.
+    Return (root_dir, commit_sha) or (None, None) on failure."""
+    url = f"{UPSTREAM_URL}/archive/{ref}.tar.gz"
+    sub = tempfile.mkdtemp(dir=dest)
+    raw = os.path.join(sub, "archive.tar.gz")
+    try:
+        with urllib.request.urlopen(url) as resp, open(raw, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except Exception:
+        return None, None
+    # The tarball embeds the commit it was built from; read it instead of a second request,
+    # so the SHA always matches the files and no API rate limit is involved. git get-tar-commit-id
+    # reads an uncompressed tar, so decompress the gzip first.
+    sha = None
+    try:
+        plain = os.path.join(sub, "archive.tar")
+        with gzip.open(raw, "rb") as gz, open(plain, "wb") as out:
+            shutil.copyfileobj(gz, out)
+        with open(plain, "rb") as fh:
+            res = subprocess.run(["git", "get-tar-commit-id"], stdin=fh, capture_output=True, text=True)
+        sha = res.stdout.strip() or None
+    except Exception:
+        sha = None
+    with tarfile.open(raw) as tar:
+        # data filter: refuse absolute paths and links escaping the destination (Python 3.12+).
+        try:
+            tar.extractall(sub, filter="data")
+        except TypeError:
+            tar.extractall(sub)
+    roots = [
+        os.path.join(sub, n)
+        for n in os.listdir(sub)
+        if n.startswith("claude-knowledge-template-") and os.path.isdir(os.path.join(sub, n))
+    ]
+    return (roots[0] if roots else None), sha
 
-for rel in $(printf '%s\n' "${!all_paths[@]}" | sort); do
-  local_file="$repo/$rel"
-  upstream_file="$upstream_dir/$rel"
-  base_file_path=""
-  if [ -n "$base_dir" ]; then base_file_path="$base_dir/$rel"; fi
 
-  has_local=false; if [ -f "$local_file" ]; then has_local=true; fi
-  has_upstream=false; if [ -f "$upstream_file" ]; then has_upstream=true; fi
-  has_base=false; if [ -n "$base_file_path" ] && [ -f "$base_file_path" ]; then has_base=true; fi
+def first_commit_date():
+    out = git("log", "--reverse", "--format=%aI")
+    lines = [l for l in out.stdout.splitlines() if l.strip()]
+    return lines[0] if lines else None
 
-  if $has_upstream && ! $has_local; then
-    status["$rel"]="new-upstream"
-    if $apply; then
-      merge_result["$rel"]="$upstream_file"
-    fi
 
-  elif $has_local && ! $has_upstream; then
-    # File exists locally but not upstream.
-    if $has_base; then
-      # It was in base but removed upstream → deleted upstream.
-      status["$rel"]="deleted-upstream"
-    else
-      # Never existed upstream (local addition). Skip — not our concern.
-      status["$rel"]="local-only"
-    fi
+def upstream_commit_before(date):
+    """Newest upstream commit on main no later than date (one unauthenticated API call)."""
+    url = f"https://api.github.com/repos/{UPSTREAM_REPO}/commits?sha=main&until={date}&per_page=1"
+    try:
+        with urllib.request.urlopen(url) as resp:
+            data = json.load(resp)
+        return data[0]["sha"] if data else None
+    except Exception:
+        return None
 
-  elif $has_upstream && $has_local; then
-    if diff -q "$local_file" "$upstream_file" >/dev/null 2>&1; then
-      status["$rel"]="up-to-date"
-    elif [ -z "$base_dir" ]; then
-      # No base: can't do three-way merge. Just report as changed.
-      status["$rel"]="changed-no-base"
-      if $apply; then
-        merge_result["$rel"]="$upstream_file"
-      fi
-    else
-      # Three-way merge.
-      local_changed=true; upstream_changed=true
-      if $has_base; then
-        if diff -q "$base_file_path" "$local_file" >/dev/null 2>&1; then local_changed=false; fi
-        if diff -q "$base_file_path" "$upstream_file" >/dev/null 2>&1; then upstream_changed=false; fi
-      else
-        # File didn't exist in base: both sides added it independently.
-        local_changed=true
-        upstream_changed=true
-      fi
 
-      if ! $upstream_changed; then
-        status["$rel"]="changed-local-only"
-      elif ! $local_changed; then
-        status["$rel"]="changed-upstream-only"
-        if $apply; then
-          merge_result["$rel"]="$upstream_file"
-        fi
-      else
-        status["$rel"]="changed-both"
-        if $apply; then
-          merged="$tmp/merged-$(echo "$rel" | tr '/' '-')"
-          base_for_merge="$base_file_path"
-          if ! $has_base; then
-            base_for_merge="$tmp/empty"
-            touch "$base_for_merge"
-          fi
-          if git merge-file -p "$local_file" "$base_for_merge" "$upstream_file" > "$merged" 2>/dev/null; then
-            merge_result["$rel"]="$merged"
-          else
-            merge_result["$rel"]="$merged"
-            has_conflicts["$rel"]=1
-          fi
-        fi
-      fi
-    fi
-  fi
-done
+def clone_merge_base():
+    """For a cloned copy that shares history with upstream, the newest commit common to both.
+    Fetch upstream's current main as a detached object, then merge-base it with HEAD.
+    Return the SHA or None (e.g. a 'Use this template' copy with no shared history)."""
+    if git("rev-parse", "--git-dir").returncode != 0:
+        return None  # not a git repo
+    if git("fetch", "--quiet", f"{UPSTREAM_URL}.git", "main").returncode != 0:
+        return None
+    sha = git("merge-base", "HEAD", "FETCH_HEAD").stdout.strip()
+    return sha or None
 
-# --- Report ---
-echo ""
-echo "Upstream: $upstream_repo @ ${upstream_sha:0:12}"
-if [ -n "$base_sha" ]; then
-  echo "Base:     ${base_sha:0:12}"
-else
-  echo "Base:     (none — first run)"
-fi
-echo ""
 
-print_section() {
-  local label="$1" filter="$2"
-  local found=false
-  for rel in $(printf '%s\n' "${!status[@]}" | sort); do
-    [ "${status[$rel]}" = "$filter" ] || continue
-    $found || { echo "### $label"; found=true; }
-    echo "  $rel"
-  done
-  $found && echo "" || true
-}
+def read_base_sha():
+    if os.path.exists(BASE_STATE_FILE):
+        with open(BASE_STATE_FILE, encoding="utf-8") as fh:
+            sha = fh.read().strip()
+        return sha or None
+    return None
 
-print_section "Up to date" "up-to-date"
-print_section "Changed upstream only (safe to apply)" "changed-upstream-only"
-print_section "Changed locally only (no upstream update)" "changed-local-only"
-print_section "Changed on both sides (needs review)" "changed-both"
-print_section "Changed (no base — manual review needed)" "changed-no-base"
-print_section "New upstream (not present locally)" "new-upstream"
-print_section "Deleted upstream (present locally)" "deleted-upstream"
-print_section "Local only (not in upstream)" "local-only"
 
-# --- Apply ---
-if ! $apply; then
-  echo "Run with --apply to perform merges and update files."
-  echo "Files with both-sides changes will get conflict markers for manual resolution."
-  exit 0
-fi
+def collect_paths(*dirs):
+    paths = set()
+    for d in dirs:
+        if not d:
+            continue
+        for root, _, files in os.walk(d):
+            if ".git" in root.split(os.sep):
+                continue
+            for name in files:
+                rel = os.path.relpath(os.path.join(root, name), d)
+                if trackable(rel):
+                    paths.add(rel)
+    return sorted(paths)
 
-echo "=== Applying updates ==="
-applied=0
-conflicted=0
-for rel in $(printf '%s\n' "${!merge_result[@]}" | sort); do
-  src="${merge_result[$rel]}"
-  dest="$repo/$rel"
-  mkdir -p "$(dirname "$dest")"
 
-  if [ "${has_conflicts[$rel]:-}" = "1" ]; then
-    cp "$src" "$dest"
-    echo "CONFLICT: $rel (conflict markers inserted, resolve manually)"
-    conflicted=$((conflicted + 1))
-  else
-    cp "$src" "$dest"
-    # Preserve executable bit from upstream
-    if [ -x "$upstream_dir/$rel" ] 2>/dev/null; then chmod +x "$dest"; fi
-    echo "Applied:  $rel"
-    applied=$((applied + 1))
-  fi
-done
+def same(a, b):
+    return os.path.isfile(a) and os.path.isfile(b) and open(a, "rb").read() == open(b, "rb").read()
 
-# Handle deleted-upstream files: report but don't auto-delete
-for rel in $(printf '%s\n' "${!status[@]}" | sort); do
-  if [ "${status[$rel]}" = "deleted-upstream" ]; then
-    echo "DELETED UPSTREAM: $rel (kept locally — remove manually if desired)"
-  fi
-done
 
-# Update the base commit
-echo "$upstream_sha" > "$base_state_file"
-echo ""
-echo "Applied $applied file(s), $conflicted conflict(s)."
-echo "Base updated to ${upstream_sha:0:12}."
-if [ $conflicted -gt 0 ]; then
-  echo "Resolve conflicts, then commit."
-fi
+def merge_file(local, base, upstream, out):
+    """Three-way merge into out. Return True if clean, False if it has conflict markers."""
+    labels = ["-L", "local", "-L", "base", "-L", "upstream"]
+    res = subprocess.run(
+        ["git", "merge-file", "-p", *labels, local, base, upstream],
+        capture_output=True,
+    )
+    with open(out, "wb") as fh:
+        fh.write(res.stdout)
+    return res.returncode == 0
+
+
+def classify(rel, upstream_dir, base_dir):
+    """Return (status, local, upstream, base-or-None). status drives both report and apply."""
+    local = os.path.join(REPO, rel)
+    up = os.path.join(upstream_dir, rel)
+    base = os.path.join(base_dir, rel) if base_dir else None
+    has_local, has_up = os.path.isfile(local), os.path.isfile(up)
+    has_base = bool(base) and os.path.isfile(base)
+
+    if has_up and not has_local:
+        # Present upstream, absent locally. If the base had it, the copy deleted it on purpose:
+        # leave it gone unless upstream changed it since the base.
+        if has_base:
+            if same(base, up):
+                return "deleted-local", local, up, base
+            return "changed-upstream-deleted-local", local, up, base
+        return "new-upstream", local, up, None
+    if has_local and not has_up:
+        if has_base:
+            return "deleted-upstream", local, up, base
+        return "local-only", local, up, None
+    if has_local and has_up:
+        if same(local, up):
+            return "up-to-date", local, up, base if has_base else None
+        if base_dir is None:
+            return "changed-no-base", local, up, None
+        local_changed = not (has_base and same(base, local))
+        upstream_changed = not (has_base and same(base, up))
+        if not upstream_changed:
+            return "changed-local-only", local, up, base
+        if not local_changed:
+            return "changed-upstream-only", local, up, base
+        return "changed-both", local, up, base
+    return "absent", local, up, None
+
+
+def resolve_base(tmp):
+    """Find and extract the base version. Return (base_dir-or-None, base_sha-or-None)."""
+    stored = read_base_sha()
+    if stored:
+        print(f"Stored base: {stored[:12]}")
+        base_dir, _ = download_tarball(stored, tmp)
+        if base_dir:
+            return base_dir, stored
+        print(f"warning: could not fetch base commit {stored}; treating as no base", file=sys.stderr)
+        return None, None
+    # First run: work out the base once.
+    # A cloned copy shares history with upstream: use their merge-base.
+    shared = clone_merge_base()
+    if shared:
+        print(f"Bootstrapping base from shared commit {shared[:12]} (clone merge-base)")
+        base_dir, _ = download_tarball(shared, tmp)
+        if base_dir:
+            return base_dir, shared
+    # A "Use this template" copy shares no history: use the newest upstream commit
+    # older than the copy's first commit.
+    date = first_commit_date()
+    if date:
+        sha = upstream_commit_before(date)
+        if sha:
+            print(f"Bootstrapping base from upstream {sha[:12]} (newest before {date[:10]})")
+            base_dir, _ = download_tarball(sha, tmp)
+            if base_dir:
+                return base_dir, sha
+    print("note: no base found; differing files are reported but will not be written")
+    return None, None
+
+
+SECTIONS = [
+    ("changed-upstream-only", "Changed upstream only (safe to apply)"),
+    ("changed-both", "Changed on both sides (merge, review result)"),
+    ("changed-upstream-deleted-local", "Changed upstream, deleted locally (restores file)"),
+    ("new-upstream", "New upstream (not present locally)"),
+    ("changed-no-base", "Changed, no base (will NOT be written — find a base first)"),
+    ("deleted-upstream", "Deleted upstream (kept locally)"),
+    ("changed-local-only", "Changed locally only (no upstream update)"),
+    ("up-to-date", "Up to date"),
+    ("deleted-local", "Deleted locally (stays deleted)"),
+    ("local-only", "Local only (not in upstream)"),
+]
+# Statuses whose merge result is written by --apply.
+APPLIABLE = {"changed-upstream-only", "changed-both", "changed-upstream-deleted-local", "new-upstream"}
+
+
+def build(upstream_dir, base_dir):
+    paths = collect_paths(upstream_dir, REPO, base_dir)
+    return {rel: classify(rel, upstream_dir, base_dir) for rel in paths}
+
+
+def plan_merge(status, local, up, base, tmp):
+    """Produce (result_path, clean) for an appliable file, running the three-way merge when needed."""
+    if status in ("changed-upstream-only", "new-upstream", "changed-upstream-deleted-local"):
+        return up, True
+    # changed-both
+    base_in = base
+    if base_in is None or not os.path.isfile(base_in):
+        base_in = os.path.join(tmp, "empty")
+        open(base_in, "w").close()
+    out = os.path.join(tmp, "merged-" + status + "-" + local.replace(os.sep, "-"))
+    clean = merge_file(local, base_in, up, out)
+    return out, clean
+
+
+def report(items, upstream_sha, base_sha, tmp, upstream_dir, base_dir):
+    print()
+    print(f"Upstream: {UPSTREAM_REPO} @ {(upstream_sha or 'unknown')[:12]}")
+    print(f"Base:     {base_sha[:12] if base_sha else '(none)'}")
+    print()
+    by_status = {}
+    for rel, (status, *_rest) in items.items():
+        by_status.setdefault(status, []).append(rel)
+    for status, label in SECTIONS:
+        rels = sorted(by_status.get(status, []))
+        if not rels:
+            continue
+        print(f"### {label}")
+        for rel in rels:
+            suffix = ""
+            if status == "changed-both":
+                _, local, up, base = items[rel]
+                _, clean = plan_merge(status, local, up, base, tmp)
+                suffix = "  (merges clean)" if clean else "  (CONFLICT)"
+            print(f"  {rel}{suffix}")
+        print()
+    print("Run with --apply to write safe files and merged results.")
+    print("Run --apply PATH ... to write only chosen files, or --diff PATH to preview a merge.")
+
+
+def apply(items, upstream_sha, base_sha, base_dir, selected, tmp, upstream_dir):
+    if base_sha is None and base_dir is None:
+        # Without a base the three-way merge is impossible; writing upstream over local would
+        # drop local adaptations silently (e.g. empty an adapted blocked-patterns.txt). Refuse.
+        no_base = [rel for rel, (s, *_r) in items.items() if s == "changed-no-base"]
+        if no_base:
+            print("Refusing to write: no base commit, so local edits cannot be told from upstream.")
+            print("Files left untouched:")
+            for rel in sorted(no_base):
+                print(f"  {rel}")
+    if upstream_sha is None:
+        die("no upstream commit id (tarball download failed); nothing written, base unchanged")
+
+    applied = conflicted = 0
+    for rel in sorted(items):
+        status, local, up, base = items[rel]
+        if status not in APPLIABLE:
+            continue
+        if selected is not None and rel not in selected:
+            continue
+        result, clean = plan_merge(status, local, up, base, tmp)
+        dest = os.path.join(REPO, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        # Write to a sibling temp file and move it into place, so a running file (this script,
+        # if upstream changed it) is replaced atomically rather than rewritten while in use.
+        fd, staged = tempfile.mkstemp(dir=os.path.dirname(dest))
+        os.close(fd)
+        shutil.copyfile(result, staged)
+        if os.access(os.path.join(upstream_dir, rel), os.X_OK):
+            os.chmod(staged, 0o755)
+        os.replace(staged, dest)
+        if clean:
+            print(f"Applied:  {rel}")
+            applied += 1
+        else:
+            print(f"CONFLICT: {rel} (conflict markers written, resolve manually)")
+            conflicted += 1
+
+    for rel in sorted(items):
+        if items[rel][0] == "deleted-upstream":
+            print(f"DELETED UPSTREAM: {rel} (kept locally — remove manually if desired)")
+
+    # Advance the base only on a full apply. On a partial apply (--apply PATH ...) the
+    # un-applied both-sides files are still behind upstream; moving the base would relabel
+    # them "changed locally only" and never offer their upstream change again. A full apply
+    # writes every file (conflicts included, as markers to resolve), so the base can move.
+    if selected is None:
+        with open(BASE_STATE_FILE, "w", encoding="utf-8") as fh:
+            fh.write(upstream_sha + "\n")
+        base_note = f"Base updated to {upstream_sha[:12]}."
+    else:
+        base_note = "Base left unchanged (partial apply); rerun without PATH to sync fully."
+    print()
+    print(f"Applied {applied} file(s), {conflicted} conflict(s).")
+    print(base_note)
+    if conflicted:
+        print("Resolve conflicts, then commit.")
+
+
+def main():
+    args = sys.argv[1:]
+    mode, selected, diff_path = "report", None, None
+    if args and args[0] == "--diff":
+        if len(args) != 2:
+            die("usage: check-upstream --diff PATH")
+        mode, diff_path = "diff", args[1]
+    elif args and args[0] == "--apply":
+        mode = "apply"
+        rest = args[1:]
+        selected = set(rest) if rest else None
+    elif args:
+        die(f"unknown argument: {args[0]}")
+
+    tmp = tempfile.mkdtemp(prefix="check-upstream-")
+    try:
+        print(f"Fetching upstream from {UPSTREAM_URL} ...")
+        upstream_dir, upstream_sha = download_tarball("refs/heads/main", tmp)
+        if not upstream_dir:
+            die("failed to download upstream tarball")
+        base_dir, base_sha = resolve_base(tmp)
+        items = build(upstream_dir, base_dir)
+
+        if mode == "diff":
+            if diff_path not in items:
+                die(f"{diff_path} is not a tracked file")
+            status, local, up, base = items[diff_path]
+            result, clean = plan_merge(status, local, up, base, tmp)
+            with open(result, encoding="utf-8", errors="replace") as fh:
+                sys.stdout.write(fh.read())
+            return
+        if mode == "apply":
+            apply(items, upstream_sha, base_sha, base_dir, selected, tmp, upstream_dir)
+            return
+        report(items, upstream_sha, base_sha, tmp, upstream_dir, base_dir)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
